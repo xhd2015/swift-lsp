@@ -1,0 +1,60 @@
+{
+  "name": "swift-lsp",
+  "displayName": "Swift LSP",
+  "description": "Swift Language Server Protocol implementation",
+  "version": "0.0.1",
+  "publisher": "local",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xhd2015/swift-lsp"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:swift"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "swift",
+        "extensions": [
+          ".swift"
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --allow-missing-repository --no-git-tag-version --no-update-package-json",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1",
+    "vscode-languageserver": "^9.0.1",
+    "vscode-languageserver-textdocument": "^1.0.11"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.19",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.7.3",
+    "@vscode/vsce": "^2.24.0"
+  },
+  "bundleDependencies": [
+    "vscode-languageclient",
+    "vscode-languageserver",
+    "vscode-languageserver-textdocument"
+  ],
+  "files": [
+    "README.md",
+    "out/**/*",
+    "node_modules/**/*"
+  ]
+}
