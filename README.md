@@ -13,3 +13,7 @@ npm run package
 
 code --install-extension swift-lsp-0.0.1.vsix
 ```
+
+# Roadmap
+
+- [ ] token cache

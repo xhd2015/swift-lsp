@@ -10,7 +10,10 @@ import {
     TextDocumentPositionParams,
     Position,
     Logger,
-    WorkspaceFolder
+    WorkspaceFolder,
+    DocumentHighlight,
+    DocumentHighlightKind,
+    RegistrationRequest
 } from 'vscode-languageserver/node';
 
 import { TextDocument } from 'vscode-languageserver-textdocument';
@@ -433,7 +436,7 @@ connection.onDidChangeConfiguration(change => {
 });
 
 // Simple symbol search function
-async function findSymbolSimple(word: string): Promise<SymbolLocation | null> {
+async function findSymbol(word: string): Promise<Location | null> {
     try {
         // Simple patterns to match symbol definitions
         const simplePatterns = [
@@ -448,7 +451,7 @@ async function findSymbolSimple(word: string): Promise<SymbolLocation | null> {
         ];
 
         if (!workspaceFolders) {
-            log('No workspace folders available for simple search', 'warn');
+            log('No workspace folders available for search', 'warn');
             return null;
         }
 
@@ -472,14 +475,13 @@ async function findSymbolSimple(word: string): Promise<SymbolLocation | null> {
                             const regex = new RegExp(pattern);
                             const match = regex.exec(line);
                             if (match) {
-                                return {
-                                    uri: 'file://' + file,
-                                    line: lineNum,
-                                    character: match.index,
-                                    type: pattern.split(' ')[0] as any,
-                                    name: word,
-                                    context: undefined
-                                };
+                                return Location.create(
+                                    'file://' + file,
+                                    {
+                                        start: { line: lineNum, character: match.index },
+                                        end: { line: lineNum, character: match.index + word.length }
+                                    }
+                                );
                             }
                         }
                     }
@@ -489,41 +491,63 @@ async function findSymbolSimple(word: string): Promise<SymbolLocation | null> {
             }
         }
     } catch (error) {
-        log(`Error in simple symbol search: ${error}`, 'error');
+        log(`Error in symbol search: ${error}`, 'error');
     }
     return null;
 }
 
 connection.onInitialize(async (params: InitializeParams) => {
     log('Initializing Swift LSP server...');
+    log('Client info: ' + JSON.stringify(params.clientInfo));
+    log('Client capabilities: ' + JSON.stringify(params.capabilities));
     workspaceFolders = params.workspaceFolders || null;
 
-    try {
-        // Scan workspace for symbol definitions
-        await scanWorkspace(workspaceFolders);
+    const result: InitializeResult = {
+        capabilities: {
+            textDocumentSync: {
+                openClose: true,
+                change: TextDocumentSyncKind.Incremental
+            },
+            definitionProvider: true,
+            referencesProvider: true,  // Explicitly enable references
+            documentHighlightProvider: true,  // For highlighting same symbols
+            documentSymbolProvider: true,     // For document symbols
+            workspaceSymbolProvider: true     // For workspace symbols
+        }
+    };
+    log('Server capabilities: ' + JSON.stringify(result.capabilities));
 
-        const result: InitializeResult = {
-            capabilities: {
-                textDocumentSync: TextDocumentSyncKind.Incremental,
-                definitionProvider: true
-            }
-        };
-        return result;
-    } catch (error) {
-        log(`Initialization error: ${error}`, 'error');
-        throw error;
+    // Start scanning workspace for symbols
+    if (workspaceFolders) {
+        await scanWorkspace(workspaceFolders);
     }
+
+    return result;
 });
 
-// Update the definition handler
+// Add debug handler for all requests
+connection.onRequest(async (method: string, params: any) => {
+    log(`Received request: ${method} with params: ${JSON.stringify(params)}`);
+});
+
+// Add debug handler for all notifications
+connection.onNotification((method: string, params: any) => {
+    log(`Received notification: ${method} with params: ${JSON.stringify(params)}`);
+});
+
+// Definition handler
 connection.onDefinition(
     async (params: TextDocumentPositionParams): Promise<Definition | null> => {
+        log('Definition request received');
         try {
             const document = documents.get(params.textDocument.uri);
             if (!document) {
                 log('Document not found for definition request', 'warn');
                 return null;
             }
+
+            log(`Definition request for document: ${params.textDocument.uri}`);
+            log(`Position: line ${params.position.line}, character ${params.position.character}`);
 
             const text = document.getText();
             const position = params.position;
@@ -548,84 +572,35 @@ connection.onDefinition(
                 return null;
             }
 
-            log(`Looking for definition of: ${word} (Simple mode: ${serverConfig.useSimpleMode})`);
+            log(`Looking for definition of: ${word}`);
 
-            if (serverConfig.useSimpleMode) {
-                // Use simple search mode
-                const symbolDef = await findSymbolSimple(word);
-                if (symbolDef) {
-                    log(`Found ${symbolDef.type} definition for ${word} at ${path.basename(symbolDef.uri)}:${symbolDef.line + 1}`);
-                    return Location.create(
-                        symbolDef.uri,
-                        {
-                            start: { line: symbolDef.line, character: symbolDef.character },
-                            end: { line: symbolDef.line, character: symbolDef.character + word.length }
-                        }
-                    );
+            // Check if current position is already a definition
+            const currentLineContent = line.trim();
+            const isDefinition = (
+                currentLineContent.match(new RegExp(`(struct|class|enum|protocol|extension)\\s+${word}\\b`)) ||
+                currentLineContent.match(new RegExp(`(var|let)\\s+${word}\\s*:`)) ||
+                currentLineContent.match(new RegExp(`func\\s+${word}\\s*[(<]`))
+            );
+
+            if (isDefinition) {
+                log(`Current position is the definition of ${word}, finding references instead`);
+                // If it's a definition, find all references using our search logic directly
+                const references = await findReferences(word, params.textDocument.uri, params.position);
+
+                if (Array.isArray(references) && references.length > 0) {
+                    log(`Found ${references.length} references for ${word}`);
+                    return references;
                 }
-            } else {
-                // Use existing complex search mode
-                // Find the current context by scanning backwards
-                let contextStack: string[] = [];
-                let contextBraceCount = 0;
-                for (let i = position.line; i >= 0; i--) {
-                    const currentLine = lines[i];
-                    const openBraces = (currentLine.match(/{/g) || []).length;
-                    const closeBraces = (currentLine.match(/}/g) || []).length;
+                // If no references found, return null to avoid jumping to the same position
+                return null;
+            }
 
-                    // Process close braces first
-                    contextBraceCount -= closeBraces;
+            // If not a definition, proceed with normal definition lookup
+            const symbolDef = await findSymbol(word);
 
-                    // Look for context definitions
-                    const contextMatch = currentLine.match(/(?:struct|class|protocol|extension)\s+(\w+)/);
-                    if (contextMatch && contextBraceCount >= 0) {
-                        contextStack.unshift(contextMatch[1]);
-                    }
-
-                    // Process open braces
-                    contextBraceCount += openBraces;
-
-                    // Stop if we're at root level
-                    if (contextBraceCount < 0) {
-                        break;
-                    }
-                }
-
-                // Build context path
-                const contextPath = contextStack.join('.');
-                log(`Current context: ${contextPath || 'global'}`);
-
-                // Search for symbol in all cached files
-                let symbolDef: SymbolLocation | undefined;
-
-                // First try the current file
-                const currentFileSymbols = symbolsByUri.get(params.textDocument.uri);
-                if (currentFileSymbols) {
-                    symbolDef = contextPath ?
-                        currentFileSymbols.get(`${contextPath}.${word}`) :
-                        currentFileSymbols.get(word);
-                }
-
-                // If not found in current file, search other cached files
-                if (!symbolDef) {
-                    for (const [uri, fileSymbols] of symbolsByUri.entries()) {
-                        if (uri === params.textDocument.uri) continue;
-
-                        symbolDef = fileSymbols.get(word);
-                        if (symbolDef) break;
-                    }
-                }
-
-                if (symbolDef) {
-                    log(`Found ${symbolDef.type} definition for ${word} at ${path.basename(symbolDef.uri)}:${symbolDef.line + 1}`);
-                    return Location.create(
-                        symbolDef.uri,
-                        {
-                            start: { line: symbolDef.line, character: symbolDef.character },
-                            end: { line: symbolDef.line, character: symbolDef.character + word.length }
-                        }
-                    );
-                }
+            if (symbolDef) {
+                log(`Found definition for ${word} at ${path.basename(symbolDef.uri)}:${symbolDef.range.start.line + 1}`);
+                return symbolDef;
             }
 
             log(`No definition found for ${word}`, 'warn');
@@ -637,10 +612,170 @@ connection.onDefinition(
     }
 );
 
-// Parse all open documents initially
+// Add handler for document highlights
+connection.onDocumentHighlight(async (params) => {
+    log('Document highlight request received');
+    const document = documents.get(params.textDocument.uri);
+    if (!document) return null;
+
+    const position = params.position;
+    const word = getWordAtPosition(document, position);
+    if (!word) return null;
+
+    return findHighlights(document, word);
+});
+
+// Helper function to get word at position
+function getWordAtPosition(document: TextDocument, position: Position): string | null {
+    const text = document.getText();
+    const lines = text.split('\n');
+    const line = lines[position.line];
+    const wordRegex = /[A-Za-z0-9_]+/g;
+    let match;
+
+    while ((match = wordRegex.exec(line)) !== null) {
+        if (position.character >= match.index &&
+            position.character <= match.index + match[0].length) {
+            return match[0];
+        }
+    }
+    return null;
+}
+
+// Helper function to find highlights
+function findHighlights(document: TextDocument, word: string): DocumentHighlight[] {
+    const text = document.getText();
+    const lines = text.split('\n');
+    const highlights: DocumentHighlight[] = [];
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const regex = new RegExp(`\\b${word}\\b`, 'g');
+        let match;
+
+        while ((match = regex.exec(line)) !== null) {
+            highlights.push({
+                range: {
+                    start: { line: i, character: match.index },
+                    end: { line: i, character: match.index + word.length }
+                },
+                kind: DocumentHighlightKind.Text
+            });
+        }
+    }
+
+    return highlights;
+}
+
+// Extract reference finding logic into a reusable function
+async function findReferences(word: string, documentUri: string, position: Position): Promise<Location[] | null> {
+    const references: Location[] = [];
+
+    if (!workspaceFolders) {
+        log('No workspace folders available for references search', 'warn');
+        return null;
+    }
+
+    // First find if this is a type definition
+    const isType = await findSymbol(word) !== null;
+    log(`Word "${word}" is ${isType ? 'a type' : 'not a type'}`);
+
+    // Search in all workspace folders
+    for (const folder of workspaceFolders) {
+        const folderPath = folder.uri.replace('file://', '');
+        log(`Searching in workspace folder: ${folderPath}`);
+        const swiftFiles = findSwiftFiles(folderPath);
+        log(`Found ${swiftFiles.length} Swift files to search`);
+
+        for (const file of swiftFiles) {
+            try {
+                log(`Searching in file: ${file}`);
+                const content = fs.readFileSync(file, 'utf-8');
+                const lines = content.split('\n');
+
+                for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+                    const currentLine = lines[lineNum];
+                    if (currentLine.trim().startsWith('//')) continue;
+
+                    // For types, look for specific patterns
+                    if (isType) {
+                        const patterns = [
+                            `\\b${word}\\b\\s*{`,              // Type definition
+                            `:\\s*${word}\\b`,                 // Type annotation
+                            `\\b${word}\\s*\\(`,               // Constructor
+                            `\\bas\\s+${word}\\b`,            // Type casting
+                            `\\bvar\\s+\\w+\\s*:\\s*${word}\\b`, // Variable declaration
+                            `\\blet\\s+\\w+\\s*:\\s*${word}\\b`, // Constant declaration
+                            `\\[\\s*${word}\\s*\\]`,          // Array type
+                            `<\\s*${word}\\s*>`,              // Generic type
+                            `\\(\\s*\\w+\\s*:\\s*${word}\\b`  // Function parameter
+                        ];
+
+                        for (const pattern of patterns) {
+                            const regex = new RegExp(pattern, 'g');
+                            let match;
+                            while ((match = regex.exec(currentLine)) !== null) {
+                                const typeStart = currentLine.indexOf(word, match.index);
+                                if (typeStart !== -1) {
+                                    references.push(Location.create(
+                                        'file://' + file,
+                                        {
+                                            start: { line: lineNum, character: typeStart },
+                                            end: { line: lineNum, character: typeStart + word.length }
+                                        }
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        // For non-types, look for exact word matches
+                        const regex = new RegExp(`\\b${word}\\b`, 'g');
+                        let match;
+                        while ((match = regex.exec(currentLine)) !== null) {
+                            references.push(Location.create(
+                                'file://' + file,
+                                {
+                                    start: { line: lineNum, character: match.index },
+                                    end: { line: lineNum, character: match.index + word.length }
+                                }
+                            ));
+                        }
+                    }
+                }
+            } catch (error) {
+                log(`Error reading file ${file} for references: ${error}`, 'error');
+            }
+        }
+    }
+
+    log(`Found ${references.length} references for "${word}"`);
+    return references;
+}
+
+// Update references handler to use the shared function
+connection.onReferences(async (params) => {
+    log('References request received');
+    log('References params: ' + JSON.stringify(params));
+
+    const document = documents.get(params.textDocument.uri);
+    if (!document) {
+        log('Document not found for references request', 'warn');
+        return null;
+    }
+
+    const word = getWordAtPosition(document, params.position);
+    if (!word) {
+        log('No word found at cursor position for references', 'warn');
+        return null;
+    }
+
+    return findReferences(word, params.textDocument.uri, params.position);
+});
+
+// Document lifecycle logging
 documents.onDidOpen(e => {
     const uri = e.document.uri;
-    log(`Document opened: ${path.basename(uri)}`);
+    log(`Document opened: ${uri}`);
     try {
         parseSymbolsInContent(e.document.getText(), uri);
     } catch (error) {
@@ -648,7 +783,15 @@ documents.onDidOpen(e => {
     }
 });
 
-// Make the text document manager listen on the connection
+documents.onDidChangeContent(e => {
+    log(`Document changed: ${e.document.uri}`);
+});
+
+documents.onDidClose(e => {
+    log(`Document closed: ${e.document.uri}`);
+});
+
+// Listen for text document create, change
 documents.listen(connection);
 
 // Listen on the connection

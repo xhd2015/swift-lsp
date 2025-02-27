@@ -27,6 +27,13 @@
           ".swift"
         ]
       }
+    ],
+    "commands": [
+      {
+        "command": "swift-lsp.restartServer",
+        "title": "Restart Language Server",
+        "category": "Swift LSP"
+      }
     ]
   },
   "scripts": {
@@ -45,16 +52,11 @@
     "@types/node": "^20.11.19",
     "@types/vscode": "^1.85.0",
     "typescript": "^5.7.3",
-    "@vscode/vsce": "^2.24.0"
+    "@vscode/vsce": "^3.2.2"
   },
   "bundleDependencies": [
     "vscode-languageclient",
     "vscode-languageserver",
     "vscode-languageserver-textdocument"
-  ],
-  "files": [
-    "README.md",
-    "out/**/*",
-    "node_modules/**/*"
   ]
 }

@@ -1,0 +1,7 @@
+.git/**
+.gitignore
+test/**
+src/**
+!LICENSE
+!out/**/*
+!node_modules/**/*
